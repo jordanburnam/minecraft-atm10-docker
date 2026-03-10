@@ -90,20 +90,53 @@ if [ ! -f "/data/eula.txt" ] || ! grep -q "eula=true" /data/eula.txt; then
     echo "EULA accepted."
 fi
 
-# Apply server.properties overrides from env vars
-if [ -f "/data/server.properties" ]; then
-    if [ -n "${WORLD_SEED:-}" ]; then
-        sed -i "s/^level-seed=.*/level-seed=${WORLD_SEED}/" /data/server.properties
-        echo "World seed set to: ${WORLD_SEED}"
-    fi
-    if [ -n "${DIFFICULTY:-}" ]; then
-        sed -i "s/^difficulty=.*/difficulty=${DIFFICULTY}/" /data/server.properties
-        echo "Difficulty set to: ${DIFFICULTY}"
-    fi
-fi
-
 # Make startserver.sh executable
 chmod +x /data/startserver.sh 2>/dev/null || true
 
+# Run NeoForge install first (startserver.sh with INSTALL_ONLY)
+# This ensures server.properties gets generated before we override it
 cd /data
+ATM10_INSTALL_ONLY=true bash startserver.sh || true
+
+# Now apply server.properties overrides from env vars
+# Uses grep -v to remove old line, then appends new value (avoids sed regex issues)
+apply_property() {
+    local key="$1" value="$2"
+    if [ -f /data/server.properties ]; then
+        grep -v "^${key}=" /data/server.properties > /tmp/server.properties.tmp || true
+        mv /tmp/server.properties.tmp /data/server.properties
+    fi
+    echo "${key}=${value}" >> /data/server.properties
+}
+
+if [ -n "${WORLD_SEED:-}" ]; then
+    apply_property "level-seed" "${WORLD_SEED}"
+    echo "World seed set to: ${WORLD_SEED}"
+fi
+if [ -n "${DIFFICULTY:-}" ]; then
+    apply_property "difficulty" "${DIFFICULTY}"
+    echo "Difficulty set to: ${DIFFICULTY}"
+fi
+
+# Configure server operators from OPS env var (comma-separated Minecraft usernames)
+if [ -n "${OPS:-}" ]; then
+    echo "Configuring server operators..."
+    OPS_JSON="[]"
+    IFS=',' read -ra OP_LIST <<< "$OPS"
+    for USERNAME in "${OP_LIST[@]}"; do
+        USERNAME=$(echo "$USERNAME" | xargs)
+        PROFILE=$(curl -sf "https://api.mojang.com/users/profiles/minecraft/${USERNAME}")
+        if [ -n "$PROFILE" ]; then
+            RAW_UUID=$(echo "$PROFILE" | jq -r '.id')
+            FORMATTED_UUID=$(echo "$RAW_UUID" | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/')
+            OPS_JSON=$(echo "$OPS_JSON" | jq --arg uuid "$FORMATTED_UUID" --arg name "$USERNAME" \
+                '. += [{"uuid": $uuid, "name": $name, "level": 4, "bypassesPlayerLimit": false}]')
+            echo "  Added OP: ${USERNAME} (${FORMATTED_UUID})"
+        else
+            echo "  WARNING: Could not find Minecraft user '${USERNAME}', skipping"
+        fi
+    done
+    echo "$OPS_JSON" > /data/ops.json
+fi
+
 exec /bin/bash startserver.sh

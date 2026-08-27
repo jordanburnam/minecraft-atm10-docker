@@ -125,7 +125,7 @@ if [ -n "${OPS:-}" ]; then
     IFS=',' read -ra OP_LIST <<< "$OPS"
     for USERNAME in "${OP_LIST[@]}"; do
         USERNAME=$(echo "$USERNAME" | xargs)
-        PROFILE=$(curl -sf "https://api.mojang.com/users/profiles/minecraft/${USERNAME}")
+        PROFILE=$(curl -sf "https://api.mojang.com/users/profiles/minecraft/${USERNAME}" || true)
         if [ -n "$PROFILE" ]; then
             RAW_UUID=$(echo "$PROFILE" | jq -r '.id')
             FORMATTED_UUID=$(echo "$RAW_UUID" | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/')

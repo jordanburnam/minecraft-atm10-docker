@@ -40,6 +40,12 @@ if [ "$PACK_VERSION" = "latest" ] || [ "$PACK_MISSING" = true ]; then
             '[.data[] | select(.serverPackFileId != null)] | .[0].serverPackFileId // empty')
         MATCHED_NAME=$(echo "$FILES_JSON" | jq -r \
             '[.data[] | select(.serverPackFileId != null)] | .[0].displayName // empty')
+        LATEST_CLIENT_NAME=$(echo "$FILES_JSON" | jq -r \
+            '[.data[] | select(.isServerPack != true)] | .[0].displayName // empty')
+        if [ -n "$LATEST_CLIENT_NAME" ] && [ "$LATEST_CLIENT_NAME" != "$MATCHED_NAME" ]; then
+            echo "Latest client release: ${LATEST_CLIENT_NAME}; no server pack is attached."
+            echo "Using newest available server pack: ${MATCHED_NAME}. Clients must match this version."
+        fi
     else
         SERVER_PACK_ID=$(echo "$FILES_JSON" | jq -r --arg v "$PACK_VERSION" \
             '[.data[] | select(.serverPackFileId != null and (.displayName | endswith("-" + $v)))] | .[0].serverPackFileId // empty')
@@ -163,26 +169,74 @@ fi
 apply_property "white-list" "true"
 apply_property "enforce-whitelist" "true"
 
-# Configure server operators and whitelist entries from OPS env var.
+# Merge configured operators into saved access lists. Profile lookup failures
+# must never revoke existing access, including manually whitelisted players.
 if [ -n "${OPS:-}" ]; then
     echo "Configuring server operators and whitelist..."
     OPS_JSON="[]"
+    WHITELIST_JSON="[]"
+    if [ -f /data/ops.json ]; then
+        OPS_JSON=$(jq -e 'if type == "array" then . else error("Invalid ops.json") end' /data/ops.json)
+    fi
+    if [ -f /data/whitelist.json ]; then
+        WHITELIST_JSON=$(jq -e 'if type == "array" then . else error("Invalid whitelist.json") end' /data/whitelist.json)
+    fi
     IFS=',' read -ra OP_LIST <<< "$OPS"
     for USERNAME in "${OP_LIST[@]}"; do
         USERNAME=$(echo "$USERNAME" | xargs)
-        PROFILE=$(curl -sf "https://api.mojang.com/users/profiles/minecraft/${USERNAME}" || true)
-        if [ -n "$PROFILE" ]; then
-            RAW_UUID=$(echo "$PROFILE" | jq -r '.id')
-            FORMATTED_UUID=$(echo "$RAW_UUID" | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/')
-            OPS_JSON=$(echo "$OPS_JSON" | jq --arg uuid "$FORMATTED_UUID" --arg name "$USERNAME" \
-                '. += [{"uuid": $uuid, "name": $name, "level": 4, "bypassesPlayerLimit": false}]')
-            echo "  Added OP: ${USERNAME} (${FORMATTED_UUID})"
-        else
-            echo "  WARNING: Could not find Minecraft user '${USERNAME}', skipping"
+        if [[ ! "$USERNAME" =~ ^[A-Za-z0-9_]{1,16}$ ]]; then
+            echo "  WARNING: Invalid Minecraft username '${USERNAME}'; preserving existing access."
+            continue
         fi
+
+        # Reuse trusted local UUIDs before depending on an external lookup.
+        FORMATTED_UUID=""
+        for PROFILE_FILE in /data/ops.json /data/whitelist.json /data/usercache.json; do
+            [ -f "$PROFILE_FILE" ] || continue
+            FORMATTED_UUID=$(jq -r --arg name "$USERNAME" '
+                .[] | select((.name // "" | ascii_downcase) == ($name | ascii_downcase))
+                | .uuid // empty
+                | select(test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))
+            ' "$PROFILE_FILE" 2>/dev/null | head -n 1)
+            if [ -n "$FORMATTED_UUID" ]; then
+                echo "  Using saved UUID for ${USERNAME}."
+                break
+            fi
+        done
+
+        if [ -z "$FORMATTED_UUID" ]; then
+            for PROFILE_URL in \
+                "https://api.minecraftservices.com/minecraft/profile/lookup/name/${USERNAME}" \
+                "https://api.mojang.com/users/profiles/minecraft/${USERNAME}"; do
+                PROFILE=$(curl -fsS --connect-timeout 5 --max-time 15 --retry 2 --retry-delay 1 "$PROFILE_URL" || true)
+                RAW_UUID=$(echo "$PROFILE" | jq -r --arg name "$USERNAME" '
+                    select((.name // "" | ascii_downcase) == ($name | ascii_downcase))
+                    | .id // empty | select(test("^[0-9a-fA-F]{32}$"))
+                ' 2>/dev/null || true)
+                if [ -n "$RAW_UUID" ]; then
+                    FORMATTED_UUID=$(echo "$RAW_UUID" | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/')
+                    break
+                fi
+            done
+        fi
+
+        if [ -z "$FORMATTED_UUID" ]; then
+            echo "  WARNING: Could not resolve Minecraft user '${USERNAME}'; preserving existing access."
+            continue
+        fi
+
+        OPS_JSON=$(echo "$OPS_JSON" | jq --arg uuid "$FORMATTED_UUID" --arg name "$USERNAME" '
+            [.[] | select(.uuid != $uuid and ((.name | ascii_downcase) != ($name | ascii_downcase)))]
+            + [{uuid: $uuid, name: $name, level: 4, bypassesPlayerLimit: false}]')
+        WHITELIST_JSON=$(echo "$WHITELIST_JSON" | jq --arg uuid "$FORMATTED_UUID" --arg name "$USERNAME" '
+            [.[] | select(.uuid != $uuid and ((.name | ascii_downcase) != ($name | ascii_downcase)))]
+            + [{uuid: $uuid, name: $name}]')
+        echo "  Ensured OP and whitelist: ${USERNAME} (${FORMATTED_UUID})"
     done
-    echo "$OPS_JSON" > /data/ops.json
-    echo "$OPS_JSON" | jq '[.[] | {uuid: .uuid, name: .name}]' > /data/whitelist.json
+    printf '%s\n' "$OPS_JSON" > /data/ops.json.tmp
+    printf '%s\n' "$WHITELIST_JSON" > /data/whitelist.json.tmp
+    mv /data/ops.json.tmp /data/ops.json
+    mv /data/whitelist.json.tmp /data/whitelist.json
 fi
 
 exec /bin/bash startserver.sh

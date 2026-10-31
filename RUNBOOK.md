@@ -5,15 +5,16 @@ Status: RUNBOOK - ACTIVE
 ## Current State
 
 - Host: `jordan-mac-mini` / `192.168.4.100`
+- SSH: `ssh jordan@jordan-mac-mini`. "macmini" is a conversational nickname, not a DNS hostname or an instruction to use an SSH alias.
 - Repository: `/home/jordan/minecraft-atm10-docker`
 - Compose service: `minecraft`
 - Container: `atm10-server`
 - Restart policy: `unless-stopped`
 - Persistent data: `/home/jordan/minecraft-atm10-docker/data`
 - Port mapping: host `25565/tcp` -> container `25565/tcp`
-- Installed ATM10 version: `All the Mods 10-8.1`
+- Installed ATM10 version: `All the Mods 10-8.3` (checked 2026-10-31)
 - Minecraft version: `1.21.1`
-- NeoForge version: `21.1.249`
+- NeoForge version: `21.1.259`
 - Java image: `eclipse-temurin:21.0.8_9-jre`
 - Java runtime verified: Temurin `21.0.8+9-LTS`
 
@@ -39,6 +40,13 @@ Effective JVM args are stored in `data/user_jvm_args.txt`.
 
 Minecraft whitelist is enabled and contains the intended operators.
 
+Startup merges configured `OPS` into the saved operator and whitelist lists.
+It reuses UUIDs from `ops.json`, `whitelist.json`, or `usercache.json` before
+querying Minecraft's profile services. Failed lookups preserve existing entries,
+and manually whitelisted players remain whitelisted across restarts. To revoke
+a configured operator, remove the name from `OPS` and explicitly revoke its
+saved access in the Minecraft console.
+
 The host's `DOCKER-USER` firewall chain allows TCP `25565` from the LAN subnet
 `192.168.4.0/24` and public source `216.81.126.3`, then drops other IPv4 sources.
 Minecraft's player whitelist remains enabled as defense in depth.
@@ -51,10 +59,39 @@ entrypoint compares the latest server-pack file ID with
 differ. World data, player access files, server properties, and JVM arguments are
 preserved. Pack-managed directories are replaced so removed mods do not remain.
 
-Restart the service to check for and install the latest release:
+"Latest" means the newest release with an attached server pack. On 2026-10-31,
+CurseForge lists client release `8.4` (file `9366926`) without a server pack;
+`8.3` is the newest available server pack (file `9190182`). Clients must use
+`8.3` until a newer server pack is published. Startup logs explain this mismatch.
+
+Restart the service to check for and install the latest available server pack:
 
 ```bash
 docker compose restart minecraft
+```
+
+After changing `entrypoint.sh`, rebuild and recreate the service; a restart alone
+does not replace the script baked into the image:
+
+```bash
+docker compose build minecraft
+docker compose stop -t 120 minecraft
+docker compose up -d --no-deps minecraft
+```
+
+## Whitelist Recovery — 2026-10-31
+
+A failed profile lookup for `jordanburnam` during startup previously rebuilt the
+access lists without that player. The authenticated UUID remained in
+`data/usercache.json`: `2d109303-a6e0-4470-b119-6c27d731ad2a`. Startup now restores
+that entry from the saved cache and preserves `The_Hidden_Jedi` as an operator
+and whitelisted player. Historical connection logs and world player data contain
+these two players; no third player was found.
+
+Run the isolated access-list regression checks with:
+
+```bash
+python3 tests/test_access_lists.py -v
 ```
 
 ## Operations
@@ -109,7 +146,19 @@ tar -C /home/jordan/minecraft-atm10-docker -xzf /path/to/atm10-backup.tar.gz
 docker compose up -d
 ```
 
-## Verification Snapshot
+## Verification Snapshot — 2026-10-31
+
+- Rebuilt and recreated only the `minecraft` Compose service.
+- Minecraft reached its `Done (...)` ready message; Docker health is `healthy` with zero restarts.
+- Both `jordanburnam` and `The_Hidden_Jedi` are operators and whitelisted with their authenticated UUIDs.
+- Startup reused both saved UUIDs without depending on an external profile lookup.
+- Online authentication, whitelist enforcement, hard difficulty, and the existing world remain configured.
+- TCP `25565` accepts connections on the host.
+- Startup selected server pack `8.3` and explained that client `8.4` has no attached server pack.
+- All six isolated access-list regression checks passed.
+- qBittorrent, Gluetun, and Jellyfin remained running; Gluetun and Jellyfin remained healthy.
+
+## Original Verification Snapshot — 2026-09-21
 
 - Docker container reached the Minecraft ready message: `Done (...)! For help, type "help"`
 - Docker health status: `healthy`
